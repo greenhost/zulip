@@ -1,206 +1,156 @@
 import subprocess
-from typing import List, Optional, Set
+from typing import List, Optional
 
-from zulint.printer import ENDC, GREEN
+from zulint.printer import BOLDRED, CYAN, ENDC, GREEN
 
-from .template_parser import Token, is_django_block_tag, tokenize
-
-
-def requires_indent(line: str) -> bool:
-    line = line.lstrip()
-    return line.startswith("<")
+from .template_parser import Token
 
 
-def open_token(token: Token) -> bool:
-    if token.kind in (
-        "handlebars_start",
-        "html_start",
-    ):
-        return True
+def shift_indents_to_the_next_tokens(tokens: List[Token]) -> None:
+    """
+    During the parsing/validation phase, it's useful to have separate
+    tokens for "indent" chunks, but during pretty printing, we like
+    to attach an `.indent` field to the substantive node, whether
+    it's an HTML tag or template directive or whatever.
+    """
+    tokens[0].indent = ""
 
-    if token.kind in (
-        "django_start",
-        "jinja2_whitespace_stripped_start",
-        "jinja2_whitespace_stripped_type2_start",
-    ):
-        return is_django_block_tag(token.tag)
+    for i, token in enumerate(tokens[:-1]):
+        next_token = tokens[i + 1]
 
-    return False
+        if token.kind == "indent":
+            next_token.indent = token.s
+            token.new_s = ""
 
-
-def close_token(token: Token) -> bool:
-    return token.kind in (
-        "django_end",
-        "handlebars_end",
-        "html_end",
-        "jinja2_whitespace_stripped_end",
-    )
+        if token.kind == "newline" and next_token.kind != "indent":
+            next_token.indent = ""
 
 
-def else_token(token: Token) -> bool:
-    return token.kind in (
-        "django_else",
-        "handlebars_else",
-    )
+def token_allows_children_to_skip_indents(token: Token) -> bool:
+    # To avoid excessive indentation in templates with other
+    # conditionals, we don't require extra indentation for template
+    # logic blocks don't contain further logic as direct children.
+
+    # Each blocks are excluded from this rule, since we want loops to
+    # stand out.
+    if token.tag == "each":
+        return False
+
+    return token.kind in ("django_start", "handlebars_start") or token.tag == "a"
 
 
-def pop_unused_tokens(tokens: List[Token], row: int) -> bool:
-    while tokens and tokens[-1].line <= row:
-        token = tokens.pop()
-        if close_token(token):
-            return True
-    return False
+def adjust_block_indentation(tokens: List[Token], fn: str) -> None:
+    start_token: Optional[Token] = None
 
+    for token in tokens:
+        if token.kind in ("indent", "whitespace", "newline"):
+            continue
 
-def indent_pref(row: int, tokens: List[Token], line: str) -> str:
-    opens = 0
-    closes = 0
-    is_else = False
+        if token.tag in ("code", "pre"):
+            continue
 
-    while tokens and tokens[-1].line == row:
-        token = tokens.pop()
-        if open_token(token):
-            opens += 1
-        elif close_token(token):
-            closes += 1
-        elif else_token(token):
-            is_else = True
+        # print(token.line, repr(start_token.indent) if start_token else "?", repr(token.indent), token.s, token.end_token and "start", token.start_token and "end")
 
-    if is_else:
-        if opens and closes:
-            return "neutral"
-        return "else"
+        if token.tag == "else":
+            assert token.start_token
+            if token.indent is not None:
+                token.indent = token.start_token.indent
+            continue
 
-    i = opens - closes
-    if i == 0:
-        return "neutral"
-    elif i == 1:
-        return "open"
-    elif i == -1:
-        return "close"
-    else:
-        print(i, opens, closes)
-        raise Exception(f"too many tokens on row {row}")
+        if start_token and token.indent is not None:
+            if not start_token.indent_is_final and token.indent == start_token.orig_indent:
+                if token_allows_children_to_skip_indents(start_token):
+                    start_token.child_indent = start_token.indent
+            start_token.indent_is_final = True
 
-
-def indent_level(s: str) -> int:
-    return len(s) - len(s.lstrip())
-
-
-def same_indent(s1: str, s2: str) -> bool:
-    return indent_level(s1) == indent_level(s2)
-
-
-def next_non_blank_line(lines: List[str], i: int) -> str:
-    next_line = ""
-    for j in range(i + 1, len(lines)):
-        next_line = lines[j]
-        if next_line.strip() != "":
-            break
-    return next_line
-
-
-def get_exempted_lines(tokens: List[Token]) -> Set[int]:
-    exempted = set()
-    for code_tag in ("code", "pre", "script"):
-        for token in tokens:
-            if token.kind == "html_start" and token.tag == code_tag:
-                start: Optional[int] = token.line
-
-            if token.kind == "html_end" and token.tag == code_tag:
-                # The pretty printer expects well-formed HTML, even
-                # if it's strangely formatted, so we expect start
-                # to be None.
-                assert start is not None
-
-                # We leave code blocks completely alone, including
-                # the start and end tags.
-                for i in range(start, token.line + 1):
-                    exempted.add(i)
-                    start = None
-    return exempted
-
-
-def pretty_print_html(html: str) -> str:
-    tokens = tokenize(html)
-
-    exempted_lines = get_exempted_lines(tokens)
-
-    tokens.reverse()
-    lines = html.split("\n")
-
-    open_offsets: List[str] = []
-    formatted_lines = []
-    next_offset: str = ""
-    tag_end_row: Optional[int] = None
-    tag_continuation_offset = ""
-
-    def line_offset(row: int, line: str, next_line: str) -> Optional[str]:
-        nonlocal next_offset
-        nonlocal tag_end_row
-        nonlocal tag_continuation_offset
-
-        if tag_end_row and row < tag_end_row:
-            was_closed = pop_unused_tokens(tokens, row)
-            if was_closed:
-                next_offset = open_offsets.pop()
-            return tag_continuation_offset
-
-        offset = next_offset
-        if tokens:
-            token = tokens[-1]
-            if token.line == row and token.line_span > 1:
-                if token.kind in ("django_comment", "handlebar_comment", "html_comment"):
-                    tag_continuation_offset = offset
+        # Detect start token by its having a end token
+        if token.end_token:
+            if token.indent is not None:
+                token.orig_indent = token.indent
+                if start_token:
+                    assert start_token.child_indent is not None
+                    token.indent = start_token.child_indent
                 else:
-                    tag_continuation_offset = offset + "  "
-                tag_end_row = row + token.line_span
+                    token.indent = ""
+                token.child_indent = token.indent + "    "
+            token.parent_token = start_token
+            start_token = token
+            continue
 
-        pref = indent_pref(row, tokens, line)
-        if pref == "open":
-            if same_indent(line, next_line) and not requires_indent(line):
-                next_offset = offset
-            else:
-                next_offset = offset + " " * 4
-            open_offsets.append(offset)
-        elif pref == "else":
-            offset = open_offsets[-1]
-            if same_indent(line, next_line):
-                next_offset = offset
-            else:
-                next_offset = offset + " " * 4
-        elif pref == "close":
-            offset = open_offsets.pop()
-            next_offset = offset
-        return offset
+        # Detect end token by its having a start token
+        if token.start_token:
+            if start_token != token.start_token:
+                raise AssertionError(
+                    f"""
+                    {token.kind} was unexpected in {token.s}
+                    in row {token.line} of {fn}
+                    """
+                )
 
-    def adjusted_line(row: int, line: str, next_line: str) -> str:
-        if line.strip() == "":
-            return ""
+            if token.indent is not None:
+                token.indent = start_token.indent
+            start_token = start_token.parent_token
+            continue
 
-        offset = line_offset(row, line, next_line)
+        if token.indent is None:
+            continue
 
-        if row in exempted_lines:
-            return line.rstrip()
+        if start_token is None:
+            token.indent = ""
+            continue
 
-        if offset is None:
-            return line.rstrip()
-
-        return offset + line.strip()
-
-    for i, line in enumerate(lines):
-        # We use 1-based indexing for both rows and columns.
-        next_line = next_non_blank_line(lines, i)
-        row = i + 1
-        formatted_lines.append(adjusted_line(row, line, next_line))
-
-    return "\n".join(formatted_lines)
+        if start_token.child_indent is not None:
+            token.indent = start_token.child_indent
 
 
-def validate_indent_html(fn: str, fix: bool) -> bool:
+def fix_indents_for_multi_line_tags(tokens: List[Token]) -> None:
+    for token in tokens:
+        if token.kind == "code":
+            continue
+
+        if token.line_span == 1 or token.indent is None:
+            continue
+
+        if token.kind in ("django_comment", "handlebar_comment", "html_comment", "text"):
+            continue_indent = token.indent
+        else:
+            continue_indent = token.indent + "  "
+
+        frags = token.new_s.split("\n")
+
+        def fix(frag: str) -> str:
+            frag = frag.strip()
+            return continue_indent + frag if frag else ""
+
+        token.new_s = frags[0] + "\n" + "\n".join(fix(frag) for frag in frags[1:])
+
+
+def apply_token_indents(tokens: List[Token]) -> None:
+    for token in tokens:
+        if token.indent:
+            token.new_s = token.indent + token.new_s
+
+
+def pretty_print_html(tokens: List[Token], fn: str) -> str:
+    for token in tokens:
+        token.new_s = token.s
+
+    shift_indents_to_the_next_tokens(tokens)
+    adjust_block_indentation(tokens, fn)
+    fix_indents_for_multi_line_tags(tokens)
+    apply_token_indents(tokens)
+
+    return "".join(token.new_s for token in tokens)
+
+
+def numbered_lines(s: str) -> str:
+    return "".join(f"{i + 1: >5} {line}\n" for i, line in enumerate(s.split("\n")))
+
+
+def validate_indent_html(fn: str, tokens: List[Token], fix: bool) -> bool:
     with open(fn) as f:
         html = f.read()
-    phtml = pretty_print_html(html)
+    phtml = pretty_print_html(tokens, fn)
     if not html.split("\n") == phtml.split("\n"):
         if fix:
             print(GREEN + f"Automatically fixing indentation for {fn}" + ENDC)
@@ -209,12 +159,37 @@ def validate_indent_html(fn: str, fix: bool) -> bool:
             # Since we successfully fixed the issues, we return True.
             return True
         print(
-            "Invalid indentation detected in file: "
-            f"{fn}\nDiff for the file against expected indented file:",
+            f"""
+{BOLDRED}PROBLEM{ENDC}: formatting errors in {fn}
+
+Here is how we would like you to format
+{CYAN}{fn}{ENDC}:
+---
+{numbered_lines(phtml)}
+---
+
+Here is the diff that you should either execute in your editor
+or apply automatically with the --fix option.
+
+({CYAN}Scroll up{ENDC} to see how we would like the file formatted.)
+
+Proposed {BOLDRED}diff{ENDC} for {CYAN}{fn}{ENDC}:
+            """,
             flush=True,
         )
         subprocess.run(["diff", fn, "-"], input=phtml, universal_newlines=True)
-        print()
-        print("This problem can be fixed with the `--fix` option.")
+        print(
+            f"""
+---
+
+{BOLDRED}PROBLEM!!!{ENDC}
+
+    You have formatting errors in {CYAN}{fn}{ENDC}
+    (Usually these messages are related to indentation.)
+
+This problem can be fixed with the {CYAN}`--fix`{ENDC} option.
+Scroll up for more details about {BOLDRED}what you need to fix ^^^{ENDC}.
+            """
+        )
         return False
     return True

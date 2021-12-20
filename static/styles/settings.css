@@ -380,6 +380,14 @@ td .button {
     .hidden-email {
         font-style: italic;
     }
+
+    /* Originally the icon inherits the color of label, but when the setting
+    is disabled, the color of the label is changed and thus the icon becomes
+    too light. So, we set the color explicitly to original color of label to
+    keep the color of the icon same even when the setting is disabled. */
+    #id_realm_enable_spectator_access_label a {
+        color: hsl(0, 0%, 20%);
+    }
 }
 
 #admin-user-list,
@@ -639,11 +647,6 @@ input[type="checkbox"] {
     &.enabled {
         color: hsl(0, 0%, 20%);
     }
-}
-
-.disableable {
-    margin-left: 22px;
-    margin-top: -10px;
 }
 
 .admin-realm-message-content-delete-limit-minutes {
@@ -1626,8 +1629,17 @@ input[type="checkbox"] {
 }
 
 .dropdown-list-widget {
-    button {
-        margin: 0 5px;
+    button.dropdown-toggle {
+        text-align: left;
+
+        .fa-chevron-down {
+            float: right;
+            position: relative;
+            top: 2px;
+            padding-left: 5px;
+            color: hsl(0, 0%, 58%);
+            font-weight: lighter;
+        }
 
         &.dropdown-toggle {
             /* Match settings for select elements. */
@@ -1651,7 +1663,7 @@ input[type="checkbox"] {
     }
 
     a.dropdown_list_reset_button {
-        /* Prevent night mode from overriding background. */
+        /* Prevent dark theme from overriding background. */
         background: unset !important;
         border: none;
         margin-left: 10px;
@@ -1846,7 +1858,8 @@ input[type="checkbox"] {
 }
 
 .admin_exports_table {
-    margin: 20px;
+    margin-top: 20px;
+    margin-bottom: 20px;
 }
 
 @media (width < $lg_min) {
